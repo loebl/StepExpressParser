@@ -1,0 +1,7 @@
+*.cpp text
+*.h text
+
+*.md text
+
+Makefile text
+*.mk text
