@@ -41,6 +41,21 @@ struct step_file
     struct file_name_struct file_name;
     struct file_schema_struct file_schema;
 };
+struct inplace_entity;
+typedef boost::variant<char, std::string, unsigned long, double, unsigned, std::string, std::vector<uint8_t>, inplace_entity> entity_attribute;
+struct step_entity
+{
+    unsigned entity_id;
+    std::string entity_name;
+    //std::vector<> entity_attributes; //fusion tuple of all simple types
+    //std::vector<unsigned> inverse_attributes; //all entities which link to this one
+};
+struct inplace_entity
+{
+    std::string entity_name;
+    //std::vector<> entity_attributes; //fusion tuple of all simple types
+    //std::vector<unsigned> inverse_attributes; //all entities which link to this one
+};
 }
 
 BOOST_FUSION_ADAPT_STRUCT(
@@ -68,6 +83,16 @@ BOOST_FUSION_ADAPT_STRUCT(
     (struct express_step::file_name_struct, file_name)
     (struct express_step::file_schema_struct, file_schema)
 )
+BOOST_FUSION_ADAPT_STRUCT(
+    express_step::step_entity,
+    (unsigned, entity_id)
+    (std::string, entity_name)
+)
+BOOST_FUSION_ADAPT_STRUCT(
+    express_step::inplace_entity,
+    (std::string, entity_name)
+)
+
 
 namespace express_step
 {
@@ -143,7 +168,7 @@ struct step_header : boost::spirit::qi::grammar<Iterator, step_file(), Skipper>
 * when parsing entity references, access
 */
 template <typename Iterator, typename Skipper>
-struct step_data : boost::spirit::qi::grammar<Iterator, Skipper>
+struct step_data : boost::spirit::qi::grammar<Iterator, std::vector<step_entity>(), Skipper>
 {
     step_data() : step_data::base_type(data)
     {
@@ -151,33 +176,62 @@ struct step_data : boost::spirit::qi::grammar<Iterator, Skipper>
         using boost::spirit::ascii::upper;
         using boost::spirit::ascii::digit;
         using boost::spirit::repository::seek;
+        using boost::spirit::uint_;
         using boost::spirit::long_;
+        using boost::spirit::double_;
+        using boost::spirit::qi::uint_parser;
+        using boost::spirit::omit;
         using boost::spirit::lit;
         using boost::spirit::lexeme;
         using namespace boost::spirit::qi::labels; //for _val and _1
 
-        data = seek["DATA"] > ';' >> (*data_line) >> data_end;
+        data %= seek["DATA"] > ';' >> (*data_line) >> data_end;
         data_end = lit("ENDSEC") > ';';
         entity_name %= +(upper | digit | '_');
-        data_line = '#' > long_ > '=' > entity_name > *(char_ - ';') > ';';
+        data_line %= '#' > uint_ > '=' > entity_name > parameter_list > ';';
 
 
-        //parameter_list = '(' >> parameter >> *(',' >> parameter) >> ')';
-        //parameter = simple_type | parameter_list | '$' | '*';
-        //simple_type = simple_string | simple_int;
+        parameter_list = '(' >> (parameter % ',') >> ')';
+        //type: 
+        parameter = simple_type | parameter_list;
+        /* possible attributes:
+         * - nil: $
+         * - inherited/omitted: *
+         * - strings: 'stuff'
+         * - integers: -3125
+         * - reals: 10. or 1.55e-4
+         * - entity ids: #642
+         * - enumeration values: .FOO_BAR.
+         * - booleans: .T. and .F.
+         * - in-place types: IFCPARAMETERVALUE(0.)
+         * - lists of all the above (there are differences in the interpretation:
+         *   SET, BAG, LIST, ARRAY)
+         */
+        simple_type %= char_('*') | '$' | simple_string | simple_int | simple_real | entity_id
+            | enumeration | hex_string | inplace_type;
         simple_string %= (lexeme['\'' >> *(char_ - '\'') >> '\'']);
-        //simple_int = long_[&print_param<long>];
+        simple_int %= long_;
+        simple_real %= double_;
+        entity_id %= '#' > uint_;
+        enumeration %= '.' > entity_name > '.'; //enumerations use the same naming rules
+        inplace_type %= entity_name > parameter_list;
+        hex_string %= '"' > omit[digit] > +uint_parser<uint8_t, 16, 1, 2>() > '"';
     }
-    boost::spirit::qi::rule<Iterator, Skipper> data_line;
+    boost::spirit::qi::rule<Iterator, step_entity(), Skipper> data_line;
     boost::spirit::qi::rule<Iterator, Skipper> data_end;
     boost::spirit::qi::rule<Iterator, std::string(), Skipper> entity_name;
-    boost::spirit::qi::rule<Iterator, Skipper> data;
+    boost::spirit::qi::rule<Iterator, std::vector<step_entity>(), Skipper> data;
 
-    //boost::spirit::qi::rule<Iterator, Skipper > parameter_list;
-    //boost::spirit::qi::rule<Iterator, Skipper > parameter;
-    //boost::spirit::qi::rule<Iterator, Skipper > simple_type;
+    boost::spirit::qi::rule<Iterator, Skipper > parameter_list;
+    boost::spirit::qi::rule<Iterator, Skipper > parameter;
+    boost::spirit::qi::rule<Iterator, entity_attribute(), Skipper > simple_type;
     boost::spirit::qi::rule<Iterator, std::string(), Skipper > simple_string;
-    //boost::spirit::qi::rule<Iterator, Skipper > simple_int;
+    boost::spirit::qi::rule<Iterator, long, Skipper > simple_int;
+    boost::spirit::qi::rule<Iterator, double, Skipper > simple_real;
+    boost::spirit::qi::rule<Iterator, unsigned, Skipper > entity_id;
+    boost::spirit::qi::rule<Iterator, std::string(), Skipper > enumeration;
+    boost::spirit::qi::rule<Iterator, inplace_entity(), Skipper > inplace_type;
+    boost::spirit::qi::rule<Iterator, std::vector<uint8_t>(), Skipper > hex_string;
 };
 
 //Use this grammar as skip parameter to parse, to skip over whitespace and comments
@@ -232,9 +286,10 @@ int main(int argc, char const* argv[])
     StepDataParser step_data_parser;
     StepSkipper step_skipper;
     express_step::step_file file_contents;
+    std::vector<express_step::step_entity> data_lines;
 
     bool header_parsed = phrase_parse(first, end, step_parser, step_skipper, file_contents);
-    bool data_parsed = phrase_parse(first, end, step_data_parser, step_skipper);
+    bool data_parsed = phrase_parse(first, end, step_data_parser, step_skipper, data_lines);
     bool end_parsed = phrase_parse(first, end, "END-ISO-10303-21" > boost::spirit::lit(';'), step_skipper);
     std::cout << "Iterator at end: " << (first == end) << "\n"
         << "header parsing result: " << header_parsed << "\n"
